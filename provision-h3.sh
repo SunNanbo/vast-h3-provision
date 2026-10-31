@@ -31,14 +31,26 @@ node() { # repo sha
 node Kosinkadink/ComfyUI-VideoHelperSuite 4d907bee61e92c2e65af3bd6383a4e4d356126d1
 node kijai/ComfyUI-KJNodes ab72eda7ffad6280422d71ab7d54d3fb87c0ba18
 
-# --- 3. 模型 (断点续传，不覆盖已完成文件) ---
-AUTH=(); [ -n "$HF_TOKEN" ] && AUTH=(-H "Authorization: Bearer $HF_TOKEN")
+# --- 3. 模型 (aria2 多连接并发下载，单连接 curl 实测只有 11-14MB/s) ---
+apt-get install -y -q aria2 >/dev/null 2>&1
+HDR=(); [ -n "$HF_TOKEN" ] && HDR=(--header "Authorization: Bearer $HF_TOKEN")
+# 下载前先测速：用 LoRA 小文件的前 ~300MB，低于 MIN_MBPS 就报警并退出，方便立即换机器
+MIN_MBPS="${MIN_MBPS:-40}"
+speedtest() {
+  local d; d=$(mktemp -d)
+  local t0=$(date +%s.%N)
+  aria2c -x16 -s16 -k4M --file-allocation=none --console-log-level=error --summary-interval=0     "${HDR[@]}" --max-download-limit=0 -d "$d" -o st.bin --lowest-speed-limit=0 --timeout=20     --stop=20 "https://huggingface.co/lightx2v/Minimax-h3-Turbo/resolve/main/minimax_h3_fl2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors" >/dev/null 2>&1
+  local t1=$(date +%s.%N) sz; sz=$(stat -c %s "$d/st.bin" 2>/dev/null || echo 0)
+  rm -rf "$d"
+  python3 -c "print(round($sz/1e6/max($t1-$t0,0.1),1))"
+}
+SPEED=$(speedtest); say "speedtest: ${SPEED} MB/s (min ${MIN_MBPS})"
+if python3 -c "import sys; sys.exit(0 if $SPEED >= $MIN_MBPS else 1)"; then :; else
+  say "ERROR: download too slow (${SPEED} MB/s < ${MIN_MBPS}); destroy this instance and rent another"; exit 3; fi
 dl() { # repo path-in-repo dest-dir
   local out="$COMFY/models/$3/$(basename "$2")"
-  mkdir -p "$(dirname "$out")"
-  say "download $1/$2"
-  curl -L --fail --retry 5 --retry-delay 5 -C - "${AUTH[@]}" -o "$out" \
-    "https://huggingface.co/$1/resolve/main/$2" 2>>"$LOG" || say "ERROR: download failed $2"
+  mkdir -p "$(dirname "$out")"; say "download $1/$2"
+  aria2c -x16 -s16 -k4M -c --file-allocation=none --console-log-level=warn --summary-interval=0     "${HDR[@]}" -d "$(dirname "$out")" -o "$(basename "$out")"     "https://huggingface.co/$1/resolve/main/$2" >>"$LOG" 2>&1 || say "ERROR: download failed $2"
   say "  -> $(du -h "$out" 2>/dev/null | cut -f1)"
 }
 dl Comfy-Org/MiniMax-H3 diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors diffusion_models
